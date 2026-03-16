@@ -3,7 +3,6 @@
 Plex Library Audit Tool
 Compares what Plex has scanned vs what files actually exist on disk.
 Outputs a self-contained interactive HTML report.
-ＦＥＲＲＯ  
 """
 
 import sqlite3
@@ -65,6 +64,7 @@ def read_plex_library(db_path):
                 meta.parent_id               AS parent_id,
                 meta.metadata_type           AS media_type,
                 meta.added_at                AS added_at,
+                meta.guid                    AS guid,
                 ls.name                      AS library_name,
                 ls.section_type              AS library_type,
                 mi.width                     AS width,
@@ -80,6 +80,25 @@ def read_plex_library(db_path):
         """)
         rows = cur.fetchall()
 
+        # Deduplicate: some files appear twice — once with local:// guid and once
+        # with a real external guid (plex://, tmdb://, etc.). Always keep the best one.
+        def guid_priority(guid):
+            if not guid:
+                return 2
+            if guid.startswith('local://') or guid.startswith('com.plexapp.agents.none'):
+                return 1
+            return 0  # real external match — highest priority
+
+        best_rows = {}
+        for row in rows:
+            key = (row['file_path'] or '').strip().replace('\\', '/').lower()
+            if not key:
+                continue
+            existing = best_rows.get(key)
+            if existing is None or guid_priority(row['guid']) < guid_priority(existing['guid']):
+                best_rows[key] = row
+        rows = list(best_rows.values())
+
         # Build hierarchy lookup — also quote `index` here
         cur.execute("""
             SELECT id, title, `index` AS idx, parent_id, metadata_type
@@ -93,6 +112,11 @@ def read_plex_library(db_path):
 
         for row in rows:
             item = dict(row)
+            # Skip Plex's own internal metadata/cache files — these are stored under
+            # the Plex application data directory and are not real media files
+            fp = (item.get('file_path') or '').replace('\\', '/').lower()
+            if 'plex media server/metadata' in fp or 'plex media server\\metadata' in fp:
+                continue
             mt = item.get('media_type')
 
             show_title = season_number = ep_number = ep_title = None
@@ -149,6 +173,7 @@ def read_plex_library(db_path):
                     meta.parent_id               AS parent_id,
                     meta.metadata_type           AS media_type,
                     meta.added_at                AS added_at,
+                    meta.guid                    AS guid,
                     ls.name                      AS library_name,
                     ls.section_type              AS library_type,
                     mi.width                     AS width,
@@ -163,11 +188,24 @@ def read_plex_library(db_path):
                 ORDER BY ls.name, meta.title
             """)
             rows = cur.fetchall()
+            # Same deduplication — prefer real external guids over local://
+            best_rows = {}
+            for row in rows:
+                key = (row['file_path'] or '').strip().replace('\\', '/').lower()
+                if not key:
+                    continue
+                existing = best_rows.get(key)
+                if existing is None or guid_priority(row['guid']) < guid_priority(existing['guid']):
+                    best_rows[key] = row
+            rows = list(best_rows.values())
             cur.execute("SELECT id, title, [index] AS idx, parent_id, metadata_type FROM metadata_items")
             meta_map = {r['id']: dict(r) for r in cur.fetchall()}
 
             for row in rows:
                 item = dict(row)
+                fp = (item.get('file_path') or '').replace('\\', '/').lower()
+                if 'plex media server/metadata' in fp:
+                    continue
                 mt = item.get('media_type')
                 show_title = season_number = ep_number = ep_title = None
                 if mt == PLEX_TYPE_EPISODE:
@@ -246,11 +284,34 @@ def normalize_path(p):
     # Normalize to forward slashes and lowercase
     return p.replace('\\', '/').lower()
 
+def guid_match_status(guid, media_type=None, has_metadata=False):
+    """
+    Returns the match status based on the Plex guid:
+    - 'matched'        — confirmed external metadata match
+    - 'plex_unmatched' — agent ran but found nothing (*.agents.none)
+    - 'no_metadata'    — never attempted (local://, file://)
+
+    Special case: music tracks (media_type == PLEX_TYPE_TRACK) sourced from
+    embedded ID3 tags use local:// even when fully populated. For these,
+    fall back to checking whether metadata fields are actually present.
+    """
+    if not guid:
+        return 'no_metadata'
+    if 'agents.none' in guid:
+        return 'plex_unmatched'
+    if guid.startswith('local://') or guid.startswith('file://'):
+        # For music, local:// just means ID3-tag sourced — treat as matched if populated
+        if media_type == PLEX_TYPE_TRACK:
+            return 'matched' if has_metadata else 'no_metadata'
+        return 'no_metadata'
+    return 'matched'
+
 def cross_reference(plex_items, disk_files, debug=False):
-    matched   = []
-    unmatched = []
-    db_missing = []
-    disk_only  = []
+    matched          = []  # confirmed external match, file on disk
+    plex_unmatched   = []  # plex guessed title from filename (guid=local/none), file on disk
+    no_metadata      = []  # scanned but title completely blank
+    db_missing       = []  # in DB but gone from disk
+    disk_only        = []  # on disk, never scanned
 
     # Build normalized plex path map
     plex_path_map = {}
@@ -288,28 +349,43 @@ def cross_reference(plex_items, disk_files, debug=False):
 
     for plex_key, plex_item in plex_path_map.items():
         disk_info = disk_files.get(plex_key)
-        has_meta = bool(
-            plex_item.get('title') or
-            plex_item.get('show_title') or
-            plex_item.get('ep_title')
-        )
+        guid = plex_item.get('guid') or ''
+        media_type = plex_item.get('media_type')
+        if media_type == PLEX_TYPE_TRACK:
+            # For music with local:// guid, require BOTH a track title AND artist/album
+            # to be considered matched. show_title alone ("Various Artists") is not enough,
+            # and a track title without any artist context isn't either.
+            track_title = (plex_item.get('ep_title') or plex_item.get('title') or '').strip()
+            has_metadata = bool(track_title and plex_item.get('show_title'))
+        else:
+            has_metadata = bool(
+                plex_item.get('title') or
+                plex_item.get('ep_title') or
+                plex_item.get('show_title')
+            )
+        item_status = guid_match_status(guid, media_type=media_type, has_metadata=has_metadata)
+        # Only use item_status for disk-present items; missing files get db_missing regardless
+        def categorise(disk_i):
+            if item_status == 'matched':
+                return matched, 'matched'
+            elif item_status == 'plex_unmatched':
+                return plex_unmatched, 'plex_unmatched'
+            else:
+                return no_metadata, 'no_metadata'
+
         if disk_info:
             disk_keys_seen.add(plex_key)
-            (matched if has_meta else unmatched).append(
-                {'plex': plex_item, 'disk': disk_info,
-                 'status': 'matched' if has_meta else 'unmatched'})
+            bucket, status = categorise(disk_info)
+            bucket.append({'plex': plex_item, 'disk': disk_info, 'status': status})
         else:
-            # Fallback: check if file literally exists on disk (handles case mismatches
-            # on case-sensitive filesystems, or path recorded differently in DB)
             actual = plex_item.get('file_path', '') or ''
             actual = actual.strip()
             if actual and os.path.exists(actual):
                 disk_keys_seen.add(plex_key)
                 stub = {'path': actual, 'size_bytes': None,
                         'extension': Path(actual).suffix.lower()}
-                (matched if has_meta else unmatched).append(
-                    {'plex': plex_item, 'disk': stub,
-                     'status': 'matched' if has_meta else 'unmatched'})
+                bucket, status = categorise(stub)
+                bucket.append({'plex': plex_item, 'disk': stub, 'status': status})
             else:
                 db_missing.append({'plex': plex_item, 'disk': None, 'status': 'db_missing'})
 
@@ -318,10 +394,10 @@ def cross_reference(plex_items, disk_files, debug=False):
             disk_only.append({'plex': None, 'disk': disk_info, 'status': 'disk_only'})
 
     if debug:
-        print(f"Cross-ref result: matched={len(matched)} unmatched={len(unmatched)} "
-              f"db_missing={len(db_missing)} disk_only={len(disk_only)}", file=sys.stderr)
+        print(f"Cross-ref result: matched={len(matched)} plex_unmatched={len(plex_unmatched)} "
+              f"no_metadata={len(no_metadata)} db_missing={len(db_missing)} disk_only={len(disk_only)}", file=sys.stderr)
 
-    return matched, unmatched, db_missing, disk_only
+    return matched, plex_unmatched, no_metadata, db_missing, disk_only
 
 def fmt_date(ts):
     if not ts:
@@ -368,7 +444,7 @@ def fmt_duration(ms):
         return f'{h}h {m:02d}m'
     return f'{m}m {sec:02d}s'
 
-def build_html_report(matched, unmatched, db_missing, disk_only, db_path, scan_dirs, generated_at):
+def build_html_report(matched, plex_unmatched, no_metadata, db_missing, disk_only, db_path, scan_dirs, generated_at):
 
     def make_row(entry):
         p = entry.get('plex') or {}
@@ -442,18 +518,20 @@ def build_html_report(matched, unmatched, db_missing, disk_only, db_path, scan_d
 
     all_rows = (
         [make_row(e) for e in matched] +
-        [make_row(e) for e in unmatched] +
+        [make_row(e) for e in plex_unmatched] +
+        [make_row(e) for e in no_metadata] +
         [make_row(e) for e in db_missing] +
         [make_row(e) for e in disk_only]
     )
 
     libraries = sorted(set(r['library'] for r in all_rows if r['library'] not in ('—', '')))
     stats = {
-        'matched':    len(matched),
-        'unmatched':  len(unmatched),
-        'db_missing': len(db_missing),
-        'disk_only':  len(disk_only),
-        'total':      len(all_rows),
+        'matched':         len(matched),
+        'plex_unmatched':  len(plex_unmatched),
+        'no_metadata':     len(no_metadata),
+        'db_missing':      len(db_missing),
+        'disk_only':       len(disk_only),
+        'total':           len(all_rows),
     }
     # Collect all extensions present in the data, grouped by category
     VIDEO_EXTS  = {'.mkv','.mp4','.avi','.mov','.wmv','.m4v','.mpg','.mpeg',
@@ -485,7 +563,7 @@ def build_html_report(matched, unmatched, db_missing, disk_only, db_path, scan_d
   --bg:    #0d0f13; --bg2: #13151b; --bg3: #1a1d26; --bg4: #20232e;
   --bdr:   #252836; --bdr2:#30344a;
   --tx:    #e2e4ee; --tx2: #7c82a0; --tx3: #454960;
-  --green: #3ecf8e; --yel: #f5c842; --red: #e5534b; --blue: #4c8bf5;
+  --green: #3ecf8e; --yel: #f5c842; --ora: #f07b3f; --red: #e5534b; --blue: #4c8bf5;
   --font-m:'JetBrains Mono','Cascadia Code','Fira Code',Consolas,monospace;
   --font-s:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
   --r:7px;
@@ -509,7 +587,7 @@ body{{background:var(--bg);color:var(--tx);font-family:var(--font-m);font-size:1
 .stat.active{{border-color:var(--c,var(--bdr2))}}
 .stat-n{{font-size:20px;font-weight:700;line-height:1;color:var(--c,var(--tx))}}
 .stat-label{{font-size:10px;color:var(--tx2);margin-top:3px;font-family:var(--font-s);text-transform:uppercase;letter-spacing:.4px}}
-.s-all{{--c:var(--tx)}}.s-ok{{--c:var(--green)}}.s-unm{{--c:var(--yel)}}.s-miss{{--c:var(--red)}}.s-new{{--c:var(--blue)}}
+.s-all{{--c:var(--tx)}}.s-ok{{--c:var(--green)}}.s-punm{{--c:var(--ora)}}.s-unm{{--c:var(--yel)}}.s-miss{{--c:var(--red)}}.s-new{{--c:var(--blue)}}
 
 .filters{{display:flex;gap:9px;flex-wrap:wrap;align-items:center}}
 .flabel{{font-size:10px;color:var(--tx3);font-family:var(--font-s);text-transform:uppercase;letter-spacing:.4px;white-space:nowrap}}
@@ -608,9 +686,10 @@ th.drag-over{{background:var(--bg4);outline:2px solid var(--yel);outline-offset:
 tbody tr{{border-bottom:1px solid var(--bdr);transition:background .08s}}
 tbody tr:last-child{{border-bottom:none}}
 tbody tr:hover{{background:var(--bg3)}}
-tr.unmatched {{background:rgba(245,200,66,.03)}}
-tr.db_missing{{background:rgba(229,83,75,.03)}}
-tr.disk_only {{background:rgba(76,139,245,.03)}}
+tr.plex_unmatched{{background:rgba(240,123,63,.03)}}
+tr.no_metadata   {{background:rgba(245,200,66,.03)}}
+tr.db_missing    {{background:rgba(229,83,75,.03)}}
+tr.disk_only     {{background:rgba(76,139,245,.03)}}
 
 /* max-width:0 forces content to respect col width — no cell can push wider */
 td{{padding:7px 10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--tx2);vertical-align:middle;max-width:0}}
@@ -620,10 +699,11 @@ td.y{{color:var(--yel);font-style:italic}}
 td.f{{color:var(--tx3);font-size:11px}}
 
 .dot{{display:inline-block;width:8px;height:8px;border-radius:50%}}
-.dot.matched   {{background:var(--green);box-shadow:0 0 5px var(--green)}}
-.dot.unmatched {{background:var(--yel);box-shadow:0 0 5px var(--yel)}}
-.dot.db_missing{{background:var(--red);box-shadow:0 0 5px var(--red)}}
-.dot.disk_only {{background:var(--blue);box-shadow:0 0 5px var(--blue)}}
+.dot.matched       {{background:var(--green);box-shadow:0 0 5px var(--green)}}
+.dot.plex_unmatched{{background:var(--ora);  box-shadow:0 0 5px var(--ora)}}
+.dot.no_metadata   {{background:var(--yel);  box-shadow:0 0 5px var(--yel)}}
+.dot.db_missing    {{background:var(--red);  box-shadow:0 0 5px var(--red)}}
+.dot.disk_only     {{background:var(--blue); box-shadow:0 0 5px var(--blue)}}
 
 .empty{{text-align:center;padding:50px;color:var(--tx3);font-family:var(--font-s)}}
 ::-webkit-scrollbar{{width:6px;height:6px}}
@@ -714,15 +794,17 @@ td.f{{color:var(--tx3);font-size:11px}}
     <div class="dbinfo">{generated_at} &nbsp;·&nbsp; {scan_dirs_html}</div>
   </div>
   <div class="stats">
-    <div class="stat s-all active" onclick="filterStatus('all')"        id="btn-all">
+    <div class="stat s-all active" onclick="filterStatus('all')"             id="btn-all">
       <div class="stat-n" id="cnt-all">{stats['total']}</div><div class="stat-label">Total</div></div>
-    <div class="stat s-ok"  onclick="filterStatus('matched')"    id="btn-matched">
+    <div class="stat s-ok"   onclick="filterStatus('matched')"       id="btn-matched">
       <div class="stat-n" id="cnt-matched">{stats['matched']}</div><div class="stat-label">Matched</div></div>
-    <div class="stat s-unm" onclick="filterStatus('unmatched')"  id="btn-unmatched">
-      <div class="stat-n" id="cnt-unmatched">{stats['unmatched']}</div><div class="stat-label">No metadata</div></div>
-    <div class="stat s-miss" onclick="filterStatus('db_missing')" id="btn-db_missing">
+    <div class="stat s-punm" onclick="filterStatus('plex_unmatched')" id="btn-plex_unmatched">
+      <div class="stat-n" id="cnt-plex_unmatched">{stats['plex_unmatched']}</div><div class="stat-label">Unmatched</div></div>
+    <div class="stat s-unm"  onclick="filterStatus('no_metadata')"   id="btn-no_metadata">
+      <div class="stat-n" id="cnt-no_metadata">{stats['no_metadata']}</div><div class="stat-label">No metadata</div></div>
+    <div class="stat s-miss" onclick="filterStatus('db_missing')"    id="btn-db_missing">
       <div class="stat-n" id="cnt-db_missing">{stats['db_missing']}</div><div class="stat-label">File missing</div></div>
-    <div class="stat s-new" onclick="filterStatus('disk_only')"  id="btn-disk_only">
+    <div class="stat s-new"  onclick="filterStatus('disk_only')"     id="btn-disk_only">
       <div class="stat-n" id="cnt-disk_only">{stats['disk_only']}</div><div class="stat-label">Not in Plex</div></div>
   </div>
   <div class="filters">
@@ -745,7 +827,8 @@ td.f{{color:var(--tx3);font-size:11px}}
     <span id="result-count"></span>
     <div class="legend">
       <div class="leg"><span class="dot matched"></span>Matched</div>
-      <div class="leg"><span class="dot unmatched"></span>Scanned, no metadata</div>
+      <div class="leg"><span class="dot plex_unmatched"></span>Unmatched</div>
+      <div class="leg"><span class="dot no_metadata"></span>No metadata</div>
       <div class="leg"><span class="dot db_missing"></span>File missing</div>
       <div class="leg"><span class="dot disk_only"></span>Not in Plex</div>
     </div>
@@ -880,15 +963,16 @@ function setViewExts(v) {{
   syncPillUI();
 }}
 
-const SO={{matched:0,unmatched:1,db_missing:2,disk_only:3}};
+const SO={{matched:0,plex_unmatched:1,no_metadata:2,db_missing:3,disk_only:4}};
 let view='all', statusFilter='all', sortCol='status', sortAsc=true, filtered=[];
 
-// meta cell renderer: green if has value, yellow-italic if unmatched placeholder, faint dash otherwise
+// meta cell renderer: green if has value, orange-italic if plex_unmatched, yellow-italic if no_metadata, faint dash otherwise
 function mCell(r, field) {{
   const v = r[field];
   const hasV = v !== null && v !== undefined && v !== '';
   if (hasV) return `<td class="g" title="${{xe(v)}}">${{xe(v)}}</td>`;
-  if (r.status==='unmatched') return `<td class="y">—</td>`;
+  if (r.status==='plex_unmatched') return `<td style="color:var(--ora);font-style:italic">—</td>`;
+  if (r.status==='no_metadata')    return `<td class="y">—</td>`;
   return `<td class="f">—</td>`;
 }}
 
@@ -1171,11 +1255,12 @@ function applyFilters(){{
     if(q){{const h=(r.filename+r.folder+r.show_title+r.movie_title+r.ep_title).toLowerCase();if(!h.includes(q))return false;}}
     return true;
   }});
-  document.getElementById('cnt-all').textContent       =base.length;
-  document.getElementById('cnt-matched').textContent   =base.filter(r=>r.status==='matched').length;
-  document.getElementById('cnt-unmatched').textContent =base.filter(r=>r.status==='unmatched').length;
-  document.getElementById('cnt-db_missing').textContent=base.filter(r=>r.status==='db_missing').length;
-  document.getElementById('cnt-disk_only').textContent =base.filter(r=>r.status==='disk_only').length;
+  document.getElementById('cnt-all').textContent              = base.length;
+  document.getElementById('cnt-matched').textContent          = base.filter(r=>r.status==='matched').length;
+  document.getElementById('cnt-plex_unmatched').textContent   = base.filter(r=>r.status==='plex_unmatched').length;
+  document.getElementById('cnt-no_metadata').textContent      = base.filter(r=>r.status==='no_metadata').length;
+  document.getElementById('cnt-db_missing').textContent       = base.filter(r=>r.status==='db_missing').length;
+  document.getElementById('cnt-disk_only').textContent        = base.filter(r=>r.status==='disk_only').length;
 
   filtered=base.filter(r=>statusFilter==='all'||r.status===statusFilter);
   sortData();render();
@@ -1384,11 +1469,12 @@ requestAnimationFrame(() => {{
       const viewMatch = r => view==='all' || r.content_type===view || r.content_type==='unknown';
       const extMatch  = r => extFilter===null || extFilter.has(r.ext);
       const base = RAW.filter(r => viewMatch(r) && extMatch(r));
-      document.getElementById('cnt-all').textContent        = base.length;
-      document.getElementById('cnt-matched').textContent    = base.filter(r=>r.status==='matched').length;
-      document.getElementById('cnt-unmatched').textContent  = base.filter(r=>r.status==='unmatched').length;
-      document.getElementById('cnt-db_missing').textContent = base.filter(r=>r.status==='db_missing').length;
-      document.getElementById('cnt-disk_only').textContent  = base.filter(r=>r.status==='disk_only').length;
+      document.getElementById('cnt-all').textContent             = base.length;
+      document.getElementById('cnt-matched').textContent         = base.filter(r=>r.status==='matched').length;
+      document.getElementById('cnt-plex_unmatched').textContent  = base.filter(r=>r.status==='plex_unmatched').length;
+      document.getElementById('cnt-no_metadata').textContent     = base.filter(r=>r.status==='no_metadata').length;
+      document.getElementById('cnt-db_missing').textContent      = base.filter(r=>r.status==='db_missing').length;
+      document.getElementById('cnt-disk_only').textContent       = base.filter(r=>r.status==='disk_only').length;
       filtered = base.slice();
       sortData();
 
@@ -1444,14 +1530,15 @@ Examples:
             print(f"     {scan_dir}: {count} files", file=sys.stderr)
 
     print("Cross-referencing...")
-    matched, unmatched, db_missing, disk_only = cross_reference(plex_items, disk_files, debug=args.debug)
+    matched, plex_unmatched, no_metadata, db_missing, disk_only = cross_reference(plex_items, disk_files, debug=args.debug)
     print(f"  Matched:             {len(matched)}")
-    print(f"  Scanned, no match:   {len(unmatched)}")
+    print(f"  Unmatched (no guid): {len(plex_unmatched)}")
+    print(f"  Scanned, no meta:    {len(no_metadata)}")
     print(f"  In DB, file missing: {len(db_missing)}")
     print(f"  On disk, not in DB:  {len(disk_only)}")
 
     generated_at = datetime.now().strftime('%Y-%m-%d %H:%M')
-    html = build_html_report(matched, unmatched, db_missing, disk_only, db_path, args.scan, generated_at)
+    html = build_html_report(matched, plex_unmatched, no_metadata, db_missing, disk_only, db_path, args.scan, generated_at)
 
     with open(args.out, 'w', encoding='utf-8') as f:
         f.write(html)
